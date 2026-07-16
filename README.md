@@ -5,25 +5,7 @@ attacker traffic against a decoy web service — built end to end (bait routes,
 ingestion, database, dashboards) with no third-party SaaS in the data path.
 
 ## Architecture
-
-```
-┌─────────────────────┐       SSH + rsync        ┌──────────────────────┐
-│  decoy (Azure VM)   │ ────────────────────────▶ │  homelab (local box)  │
-│                      │      (pull, every 5min)   │                        │
-│  Flask decoy app     │                            │  ingest.py (cron)     │
-│  - bait routes       │                            │  ├─ pull_log()        │
-│    /admin, /.env,    │                            │  ├─ normalize_event() │
-│    /.git/config,     │                            │  ├─ categorize_route()│
-│    IDOR-shaped API   │                            │  └─ insert_events()   │
-│  - decoy.log         │                            │                        │
-│    (flat JSON,       │                            │  Postgres 16 (Docker)│
-│    RotatingFileHandler)│                          │  └─ honeypot_events   │
-│                      │                            │                        │
-│  Headscale (mesh VPN)│                            │  Grafana              │
-└─────────────────────┘                            │  └─ 4 dashboard panels│
-                                                     └──────────────────────┘
-```
-
+![Architecture diagram](docs/images/architecture.svg)
 Mesh connectivity between nodes runs over a self-hosted Headscale instance
 (100.64.x addressing) rather than a commercial VPN/mesh provider — consistent
 with a privacy-first, self-hosted-infrastructure approach.
@@ -79,24 +61,21 @@ possibly-already-wrong `attack_category` column), so repeated backfills don't
 compound drift. Always supports `--dry-run` before writing.
 
 ## Current dataset snapshot
+![Attack category breakdown](docs/images/attack-category-breakdown.png)
 
-Run this to regenerate current numbers (the table below should be updated
-whenever this README is revisited — don't trust stale figures):
+| Category                  | Count |
+| ------------------------- | ----- |
+| Sensitive_file_disclosure | 5673  |
+| unknown                   | 2906  |
+| scanner_fingerprint       | 2888  |
+| rce_attempt               | 1518  |
+| credential_access         | 497   |
+| known_cve_probe           | 320   |
+| info_disclosure           | 207   |
+| infra_recon               | 114   |
+| idor_probe                | 98    |
+| cve_2024_4577_rce         | 86    |
 
-```bash
-python3 -c "
-from db import get_connection
-with get_connection() as conn:
-    with conn.cursor() as cur:
-        cur.execute(\"SELECT attack_category, COUNT(*) FROM honeypot_events GROUP BY attack_category ORDER BY COUNT(*) DESC;\")
-        for cat, count in cur.fetchall():
-            print(count, cat)
-"
-```
-
-| Category | Count |
-|---|---|
-| _(run query above and fill in)_ | |
 
 ## Key engineering decisions
 
