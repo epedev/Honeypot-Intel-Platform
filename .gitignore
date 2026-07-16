@@ -1,0 +1,8 @@
+ingest.log
+decoy.log
+quarantine.jsonl
+.ingest_offset
+.env
+__pycache__/
+*.pyc
+*.bak
