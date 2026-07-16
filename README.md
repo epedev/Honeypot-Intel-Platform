@@ -6,6 +6,7 @@ ingestion, database, dashboards) with no third-party SaaS in the data path.
 
 ## Architecture
 ![Architecture diagram](docs/images/architecture.svg)
+
 Mesh connectivity between nodes runs over a self-hosted Headscale instance
 (100.64.x addressing) rather than a commercial VPN/mesh provider — consistent
 with a privacy-first, self-hosted-infrastructure approach.
