@@ -5,6 +5,7 @@ attacker traffic against a decoy web service — built end to end (bait routes,
 ingestion, database, dashboards) with no third-party SaaS in the data path.
 
 ## Architecture
+
 ![Architecture diagram](docs/images/architecture.svg)
 
 Mesh connectivity between nodes runs over a self-hosted Headscale instance
