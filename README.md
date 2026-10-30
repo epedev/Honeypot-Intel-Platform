@@ -1,138 +1,136 @@
 # Honeypot Intelligence Platform
 
-A self-hosted pipeline that captures, normalizes, categorizes, and visualizes
-attacker traffic against a decoy web service — built end to end (bait routes,
-ingestion, database, dashboards) with no third-party SaaS in the data path.
+A small pipeline that pulls HTTP request logs from an internet-facing decoy web service, normalizes them, applies rule-based labels, stores them in Postgres, and displays them in Grafana.
+
+## Status
+
+Early project. It runs and has produced a dataset, but it is closer to a **log collection and labeling pipeline** than to a threat-intelligence platform: there is no enrichment, no campaign grouping, and no payload or IOC extraction. The labels are heuristic and have known error modes (see [Known defects](#known-defects)). Read the numbers below with that in mind.
+
+## What is and is not in this repository
+
+| In this repo | Not in this repo |
+| --- | --- |
+| `ingest.py`: rsync pull, offset tracking, quarantine | The Flask decoy application and its bait routes |
+| `log_schema.py`: normalization and rule-based labeling | Grafana dashboard definitions (the four panels are not exported) |
+| `db.py`: Postgres schema and insert path | systemd units / timers used in deployment |
+| `backfill_categories.py`: relabel stored rows | The Discord dead-man's-switch alert |
+| `docs/`: architecture diagram, category chart | Tests, CI, sample logs, a license |
+
+Because the decoy is not published, the fidelity of the bait and the exact log format cannot be verified from this repository alone.
 
 ## Architecture
 
 ![Architecture diagram](docs/images/architecture.svg)
 
-Mesh connectivity between nodes runs over a self-hosted Headscale instance
-(100.64.x addressing) rather than a commercial VPN/mesh provider — consistent
-with a privacy-first, self-hosted-infrastructure approach.
+> The diagram may not match the current deployment. The deployed mesh runs over Tailscale; an earlier self-hosted Headscale setup has been decommissioned.
+
+Three nodes: a cloud VM running the decoy, a home server running Postgres, Grafana and the ingester, and a workstation. The pipeline depends on third-party services: a cloud provider for the decoy, a mesh VPN coordination service, and a Discord webhook for alerting. It is not free of third-party services.
 
 ## Data flow
 
-1. **Capture** — Flask app on `decoy` logs every hit to a bait route as a flat
-   JSON line via `RotatingFileHandler`.
-2. **Pull** — `ingest.py`, run via cron every 5 minutes on `homelab`, rsyncs
-   `decoy.log` over SSH (key-based auth, no interactive prompts).
-3. **Normalize** — `log_schema.py::normalize_event()` maps whatever shape the
-   Flask app wrote into a canonical `HoneypotEvent` dataclass. Malformed or
-   unrecognized lines are quarantined (`quarantine.jsonl`), never silently
-   dropped.
-4. **Categorize** — `log_schema.py::categorize_route()` assigns an
-   `attack_category` per event using a two-stage approach (see below).
-5. **Store** — `db.py::insert_events()` writes to Postgres, deduplicated on a
-   SHA-256 hash of `(timestamp, source_ip, route, payload)` so re-ingesting
-   the same event twice is a no-op.
-6. **Visualize** — Grafana reads directly from Postgres across four panels
-   (attack category breakdown, source IP frequency, timeline, response
-   status).
+1. **Capture.** The decoy writes each request as a JSON line to a rotating log file.
+2. **Pull.** `ingest.py` runs every 5 minutes on the home server and `rsync`s `decoy.log` over SSH with key auth. Deployment uses a systemd service and timer; the repo does not include the unit files. The cron line under Setup is the original method.
+3. **Normalize.** `log_schema.py::normalize_event()` maps log lines to a `HoneypotEvent`. Lines that fail to parse or normalize are appended to `quarantine.jsonl`. The field-name mappings (`timestamp`/`time`/`ts`, `src_ip`/`ip`/..., etc.) are defensive guesses that accept several common key names. They have not been audited against every route's real log shape.
+4. **Label.** `categorize_route()` assigns a category from the request path (plus one query-string check, see below).
+5. **Store.** Rows are inserted into Postgres, deduplicated on a SHA-256 of `(timestamp, source_ip, route, payload)`. See the defect list: this hash is too narrow.
+6. **Visualize.** Grafana reads Postgres directly (category breakdown, source IP frequency, timeline, response status). These panels count raw requests, not distinct sources or campaigns.
 
-## Attack categorization
+## How labeling works
 
-Categorization is intentionally two-stage, not a single flat lookup:
+Labeling looks only at the **request path**, with one exception: a query containing both `allow_url_include` and `auto_prepend_file` is labeled `cve_2024_4577_rce`. Method, body and user agent are not inspected.
 
-**Stage 1 — exact/substring match against `ROUTE_CATEGORY_MAP`.**
-A curated, priority-ordered dict mapping known bait-route substrings and
-named CVE fingerprints (GeoServer, Hikvision, Pulse Secure/Ivanti,
-ThinkPHP, Symfony profiler LFI, Spring Boot Actuator, CVE-2024-4577, etc.)
-to categories. Order matters — the first matching pattern wins, so more
-specific/higher-severity patterns are placed ahead of broad prefix rules.
+1. **Rule map.** `ROUTE_CATEGORY_MAP` is a case-sensitive, ordered dict of path substrings. The first match wins, so ordering matters.
+2. **Keyword fallback.** If nothing matches, a path containing any of a short list of secret-flavored substrings (`credential`, `secret`, `auth`, `token`, `rsa`, ...) is labeled `sensitive_file_disclosure`. Otherwise it is `unknown`.
 
-**Stage 2 — keyword-heuristic fallback.**
-Anything that doesn't hit an exact pattern is checked against a
-credential/secret-flavored keyword list (`credential`, `secret`, `token`,
-`tfvars`, `service-account`, etc.) before falling through to `unknown`.
-This exists because scanners use inconsistent naming for the same class of
-target file (`db.sql` vs `dump.sql` vs `database.yml`) — an exact-match-only
-map would require an ever-growing list of literal filenames and still miss
-novel variants.
+Labels are computed once at ingest and stored. `backfill_categories.py` recomputes them from the stored `raw` JSON and supports `--dry-run`.
 
-Categories in use: `credential_access`, `sensitive_file_disclosure`,
-`info_disclosure`, `rce_attempt`, `known_cve_probe`, `cve_2024_4577_rce`,
-`infra_recon`, `idor_probe`, `scanner_fingerprint`, `unknown`.
+### What the category names actually mean
 
-**Backfill.** `attack_category` is computed once at ingest time and stored,
-not recomputed on read — so categorization-logic improvements don't
-retroactively apply to historical rows automatically. `backfill_categories.py`
-recomputes every row's category from the stored raw JSONB (not from the
-possibly-already-wrong `attack_category` column), so repeated backfills don't
-compound drift. Always supports `--dry-run` before writing.
+The names describe the **target a scanner asked for**, not what happened. Nothing was disclosed or accessed.
 
-## Current dataset snapshot
+- `sensitive_file_disclosure`: a probe for a file such as `.env` or `.git/config`.
+- `credential_access`: a request to a path like `/admin` or `/login`. No credentials are inspected, so this is not evidence of a credential attack.
+- `idor_probe`: any path containing `/api/`. A single request cannot demonstrate an IDOR attempt; treat this label as "API path hit."
+- `known_cve_probe`: a path matching one of several vendor-specific patterns. The comments in `log_schema.py` that attach CVE IDs have **not** been verified, and at least one is wrong: Spring Boot Actuator exposure is not CVE-2022-22963/22965. Treat those comments as unverified notes.
+
+## Dataset snapshot
+
+A hand-copied snapshot from one point in time; it is not generated by the code and goes stale.
+
 ![Attack category breakdown](docs/images/attack-category-breakdown.png)
 
-| Category                  | Count |
-| ------------------------- | ----- |
-| Sensitive_file_disclosure | 5673  |
-| unknown                   | 2906  |
-| scanner_fingerprint       | 2888  |
-| rce_attempt               | 1518  |
-| credential_access         | 497   |
-| known_cve_probe           | 320   |
-| info_disclosure           | 207   |
-| infra_recon               | 114   |
-| idor_probe                | 98    |
-| cve_2024_4577_rce         | 86    |
+| Category | Count |
+| --- | --- |
+| sensitive_file_disclosure | 5673 |
+| unknown | 2906 |
+| scanner_fingerprint | 2888 |
+| rce_attempt | 1518 |
+| credential_access | 497 |
+| known_cve_probe | 320 |
+| info_disclosure | 207 |
+| infra_recon | 114 |
+| idor_probe | 98 |
+| cve_2024_4577_rce | 86 |
 
+About 20% of rows are `unknown` and another ~20% are `scanner_fingerprint`. The `unknown` share should **not** be read as irreducible internet noise. Testing the labeler shows it returns `unknown` for very common probes such as `/wp-login.php`, `/phpmyadmin/`, `/xmlrpc.php` and `/HNAP1/`, and for case or encoding variants such as `/.ENV` and `/%2e%65nv`. Part of that 20% is labeler coverage, not noise. The counts are also raw request counts, so a single noisy scanner can dominate a category.
 
-## Key engineering decisions
+## Known defects
 
-- **Server-side cursor for backfill** — `backfill_categories.py` uses a
-  named psycopg2 cursor (`cursor(name=...)`) rather than pulling the full
-  table into memory, since the event table can exceed 10k+ rows.
-- **Batched writes** — backfill updates are batched via `executemany` in
-  groups of 500, not one round-trip per row.
-- **Dead-man's-switch alerting** — a Discord webhook fires if ingestion
-  goes stale (no new events within the expected cron interval), rather than
-  relying on someone noticing an empty dashboard.
-- **Credential hygiene, the hard way** — an early version of this pipeline
-  had a hardcoded Postgres connection string duplicated across `.zshrc` and
-  a systemd-managed `.env`, which caused a 13+ hour silent ingestion failure
-  when the two drifted out of sync. Credentials are now `.env`-scoped
-  (`chmod 600`), loaded via `python-dotenv`, and the systemd/cron execution
-  path is treated as the source of truth — not the interactive shell.
+These were found by code review and by running `log_schema.py`, and are **not fixed** in this repository.
+
+**Data loss and correctness**
+- **Dedup hash is too narrow.** It ignores method, query string and user agent. Two different requests to the same path from the same IP with the same timestamp and empty body get the same hash, and the second is silently dropped. Verified with a benign `/index.php` POST and a CVE-2024-4577 POST.
+- **Inserted-count is wrong.** `insert_events` returns the number of rows attempted, not the number actually inserted, so "Inserted N new event(s)" overstates after `ON CONFLICT DO NOTHING`.
+- **Partial trailing line.** The offset advances to end-of-file even if the last line was still being written. That event is quarantined as bad JSON and lost.
+- **Rotation handling.** Rotation is detected only if the file shrinks. If the new file grows past the old offset between runs, ingestion resumes mid-file and skips data. Only `decoy.log` is pulled, not rotated files.
+
+**Robustness**
+- **A single bad line can stall ingestion.** Only `JSONDecodeError` is caught, but deeply nested JSON raises `RecursionError`. NUL bytes in paths or payloads are rejected by Postgres. The whole batch is one transaction and the offset only advances on success, so one such row makes every later run retry the same batch.
+- **Unbounded input.** New log data is read fully into memory with no line-length limit.
+- **No rsync timeout and no lockfile.** A hung run can overlap the next one.
+- **Not actually batched.** The backfill uses `executemany`, which in psycopg2 is a loop of single statements, and `insert_events` executes row by row.
+
+**Labeling**
+- **Substring collisions.** The `auth` and `rsa` keywords match unrelated paths (`/universal`, `/authors`). `/api/admin/...` is labeled `credential_access` because `/admin` is checked first.
+- **No normalization.** Matching is case-sensitive and there is no URL-decoding.
+- **Query-string payloads missed.** ThinkPHP-style payloads in the query of `/index.php` are labeled `scanner_fingerprint`.
+- **No tests** on `categorize_route()`.
+
+**Security and design**
+- The ingest role runs `CREATE TABLE IF NOT EXISTS` on every run, so it needs DDL rights. There is no separation between ingest, read-only dashboard, and migration roles, and no migration tool.
+- The SSH key used for the pull is a general login key. It should be restricted with a forced read-only `rrsync` command on the decoy.
+- `source_ip` is stored as `TEXT` instead of `INET`, and `src_port` as text.
+- `db.py` still contains unused `processed_blobs` code from an earlier Azure Blob design, and several docstrings reference that old design.
+- `ingest.py` depends on `db.py` importing and calling `load_dotenv()` as a side effect.
 
 ## Setup
 
-```bash
-pip install -r requirements.txt --break-system-packages   # no venv yet, see Known limitations
-cp .env.example .env   # fill in POSTGRES_CONN_STRING, HONEYPOT_SSH_USER, HONEYPOT_VM_IP
-chmod 600 .env
-python3 backfill_categories.py --dry-run   # sanity check before first real run
+There is no `.env.example` in this repo. Create `.env` with:
+
+```
+POSTGRES_CONN_STRING=postgresql://user:password@host:5432/dbname
+HONEYPOT_SSH_USER=<user on the decoy>
+HONEYPOT_VM_IP=<decoy address>
 ```
 
-Cron (every 5 minutes):
+```bash
+chmod 600 .env
+pip install -r requirements.txt --break-system-packages   # no venv; see defects
+python3 backfill_categories.py --dry-run
+```
+
+`ingest.py` expects an SSH key at `~/.ssh/azure_honeypot` and the remote log at `/opt/decoy-system/logs/decoy.log`; both are hardcoded.
+
+Original cron line (deployment now uses a systemd timer):
+
 ```
 */5 * * * * /usr/bin/python3 /home/epedev/honeypot-grafana-pipeline/ingest.py >> /home/epedev/honeypot-grafana-pipeline/ingest.log 2>&1
 ```
 
-## Known limitations / open items
+## Lessons from running it
 
-Documented deliberately rather than hidden — these are understood gaps, not
-undiscovered ones:
+An early version kept the Postgres connection string both in `.zshrc` and in a systemd-managed `.env`. When the two drifted apart, ingestion failed silently for more than 13 hours. Credentials now live in a `chmod 600` `.env`, loaded with `python-dotenv`, and the systemd path is treated as the source of truth rather than the interactive shell. A dead-man's-switch Discord alert (not included in this repo) was added so staleness does not depend on someone noticing an empty dashboard.
 
-- **No venv** — currently runs against system Python with
-  `pip install --break-system-packages`. Fragile against system package
-  upgrades; wrapping in a venv is the next infra task.
-- **No rsync timeout or lockfile** — `ingest.py`'s `pull_log()` has no
-  `timeout=` on the rsync subprocess call, and nothing prevents two
-  overlapping cron invocations from racing on the offset file if one run
-  hangs.
-- **`db.py` has unused blob-tracking code** (`processed_blobs`,
-  `is_blob_processed`, `mark_blob_processed`) left over from an earlier
-  Azure Blob Storage-based design that was replaced by direct SSH pull.
-  Not wired into the current pipeline; scheduled for removal.
-- **No unit tests on `categorize_route()`** — the single function
-  determining every event's classification has no automated test coverage.
-  Given a keyword-heuristic fallback exists, this is a real gap: a future
-  edit could silently break classification for a whole category with no
-  signal until a manual audit catches it.
-- **`unknown` residual (~20% of dataset)** — after exact-match and keyword
-  heuristic passes, roughly one-fifth of traffic remains uncategorized.
-  This is treated as an accepted baseline (genuinely diverse internet scan
-  noise) rather than a target to drive to zero — see the categorization
-  section above for the tradeoff reasoning.
+## Not built
+
+Enrichment (ASN/GeoIP, GreyNoise, AbuseIPDB); session or campaign grouping; payload decoding and IOC extraction; ATT&CK/CWE mapping of categories; STIX/MISP export.
